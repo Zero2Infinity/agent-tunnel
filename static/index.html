@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="mobile-web-app-capable" content="yes">
+    <title>Agent Tunnel</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- Login Overlay -->
+    <div id="login-overlay" class="overlay">
+        <div class="login-container">
+            <h1>Agent Tunnel</h1>
+            <p class="subtitle">Access your local terminal from anywhere</p>
+            
+            <form id="login-form">
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input 
+                        type="text" 
+                        id="username" 
+                        name="username" 
+                        required 
+                        autocomplete="username"
+                        placeholder="Enter your macOS username"
+                    >
+                </div>
+                
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input 
+                        type="password" 
+                        id="password" 
+                        name="password" 
+                        required 
+                        autocomplete="current-password"
+                        placeholder="Enter your password"
+                    >
+                </div>
+                
+                <div id="error-message" class="error-message"></div>
+                <div id="remaining-attempts" class="remaining-attempts"></div>
+                
+                <button type="submit" class="login-btn">
+                    <span class="btn-text">Connect</span>
+                    <span class="btn-loader" style="display: none;">Connecting...</span>
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Terminal Container -->
+    <div id="terminal-container" class="terminal-container" style="display: none;">
+        <div id="terminal"></div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
