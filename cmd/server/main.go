@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 
 	"agent-tunnel/internal/auth"
 	"agent-tunnel/internal/pty"
+	"agent-tunnel/internal/tunnel"
 	"agent-tunnel/internal/ws"
 )
 
@@ -72,6 +74,7 @@ type Server struct {
 	rateLimiter *auth.RateLimiter
 	ptyManager  *pty.Manager
 	wsHandler   *ws.Handler
+	tunnelMgr   *tunnel.Manager
 	port        string
 	staticPath  string
 }
@@ -92,35 +95,66 @@ func NewServer(port, shell, staticPath string) *Server {
 
 // Start initializes and starts the HTTP server
 func (s *Server) Start() error {
-	// Create WebSocket handler
+	s.logger.LogEvent("server_start", map[string]interface{}{
+		"port":       s.port,
+		"staticPath": s.staticPath,
+	})
+
 	s.wsHandler = ws.NewHandler(s.ptyManager, s.logger)
 
-	// Setup routes
 	mux := http.NewServeMux()
 
-	// API routes
 	mux.HandleFunc("/api/login", s.handleLogin)
 	mux.HandleFunc("/api/logout", s.handleLogout)
 
-	// WebSocket endpoint
 	mux.Handle("/ws", s.wsHandler)
 
-	// Static files
 	fs := http.FileServer(http.Dir(s.staticPath))
 	mux.Handle("/", fs)
 
-	// Create HTTP server
+	var listener net.Listener
+	var err error
+
+	log.Printf("Attempting to bind to :%s", s.port)
+	listener, err = net.Listen("tcp", ":"+s.port)
+	if err != nil {
+		return fmt.Errorf("failed to listen on port %s: %w", s.port, err)
+	}
+	log.Printf("Successfully bound to :%s", s.port)
+
 	server := &http.Server{
-		Addr:    ":" + s.port,
 		Handler: mux,
 	}
 
-	log.Printf("Server starting on http://localhost:%s", s.port)
+	go s.handleShutdown(server, listener)
 
-	// Graceful shutdown
-	go s.handleShutdown(server)
+	if s.tunnelMgr != nil {
+		wgAddr := s.tunnelMgr.GetServerIP() + ":" + s.port
+		wgListener, wgErr := net.Listen("tcp", wgAddr)
+		if wgErr != nil {
+			log.Printf("Warning: Could not bind to WireGuard IP %s: %v", wgAddr, wgErr)
+		} else {
+			log.Printf("Successfully bound to WireGuard IP: %s", wgAddr)
+			wgServer := &http.Server{Handler: mux}
+			go func() {
+				if err := wgServer.Serve(wgListener); err != nil && err != http.ErrServerClosed {
+					log.Printf("WireGuard listener error: %v", err)
+				}
+			}()
+			s.logger.LogEvent("wg_server_start", map[string]interface{}{
+				"serverIP":   s.tunnelMgr.GetServerIP(),
+				"port":       s.port,
+				"listenPort": s.tunnelMgr.GetListenPort(),
+				"wgListener": "active",
+			})
+		}
+		log.Printf("Server starting on http://localhost:%s (WireGuard: http://%s:%s)",
+			s.port, s.tunnelMgr.GetServerIP(), s.port)
+	} else {
+		log.Printf("Server starting on http://localhost:%s", s.port)
+	}
 
-	return server.ListenAndServe()
+	return server.Serve(listener)
 }
 
 // handleLogin handles login requests
@@ -132,7 +166,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	clientIP := auth.GetClientIP(r.RemoteAddr)
 
-	// Check rate limit
 	if !s.rateLimiter.Allow(clientIP) {
 		s.logger.LogEvent("rate_limit_hit", map[string]interface{}{
 			"ip": clientIP,
@@ -145,7 +178,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -159,7 +191,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Authenticate
 	err := s.auth.Authenticate(req.Username, req.Password)
 	if err != nil {
 		remaining := s.rateLimiter.GetRemainingAttempts(clientIP)
@@ -179,7 +210,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Success - clear rate limit and set session cookie
 	s.rateLimiter.Reset(clientIP)
 
 	sessionID := fmt.Sprintf("%s_%d", req.Username, time.Now().Unix())
@@ -206,14 +236,13 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 // handleLogout handles logout requests
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	// Clear session cookie
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session",
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   -1, // Delete cookie
+		MaxAge:   -1,
 	})
 
 	s.logger.LogEvent("logout", map[string]interface{}{
@@ -227,34 +256,124 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleShutdown handles graceful shutdown
-func (s *Server) handleShutdown(server *http.Server) {
+func (s *Server) handleShutdown(server *http.Server, listener net.Listener) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	<-sigChan
 	s.logger.LogEvent("server_shutdown", map[string]interface{}{})
 
-	// Create a context with timeout for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Shutdown HTTP server
 	if err := server.Shutdown(ctx); err != nil {
 		s.logger.LogError("server_shutdown_error", err, map[string]interface{}{})
 	}
 
-	// Cleanup PTY sessions
+	listener.Close()
+
 	s.ptyManager.Cleanup()
+
+	if s.tunnelMgr != nil {
+		s.tunnelMgr.Stop()
+	}
 }
 
 func main() {
-	// Parse command-line flags
 	port := flag.String("port", "4020", "HTTP server port")
 	shell := flag.String("shell", "", "Shell to use (default: $SHELL)")
 	staticPath := flag.String("static", "./static", "Path to static files")
+	wgEnabled := flag.Bool("wg", false, "Enable WireGuard VPN mode")
+	wgPort := flag.Int("wg-port", 51820, "WireGuard listen port")
+	genClient := flag.String("gen-client", "", "Generate client configuration file")
+	showQR := flag.Bool("show-qr", true, "Show QR code when generating client config")
+	endpoint := flag.String("endpoint", "", "Public endpoint for client config (e.g., 1.2.3.4:51820)")
+	serverIP := flag.String("server-ip", "10.8.0.1", "WireGuard server IP address")
 	flag.Parse()
 
-	server := NewServer(*port, *shell, *staticPath)
+	logger := &Logger{service: "agent-tunnel"}
+
+	if *genClient != "" {
+		pm, err := tunnel.NewPeerManager(*serverIP)
+		if err != nil {
+			log.Fatalf("Failed to create peer manager: %v", err)
+		}
+
+		peer, err := pm.AddPeer(*genClient)
+		if err != nil {
+			log.Fatalf("Failed to add peer: %v", err)
+		}
+
+		endpointToUse := *endpoint
+		if endpointToUse == "" {
+			endpointToUse = fmt.Sprintf("127.0.0.1:%d", *wgPort)
+		}
+
+		config := pm.GenerateClientConfig(peer, endpointToUse)
+
+		configFile := *genClient + ".conf"
+		if err := os.WriteFile(configFile, []byte(config), 0644); err != nil {
+			log.Fatalf("Failed to write config file: %v", err)
+		}
+		fmt.Printf("Client configuration saved to: %s\n", configFile)
+
+		if *showQR {
+			fmt.Println("\nScan this QR code with your WireGuard app:")
+			if err := tunnel.PrintQRCodeHalfBlock(config); err != nil {
+				log.Printf("Failed to generate QR code: %v", err)
+			}
+		}
+
+		fmt.Printf("\nWireGuard endpoint: %s\n", endpointToUse)
+		fmt.Printf("Client IP: %s\n", peer.IPAddress)
+
+		return
+	}
+
+	var tunnelMgr *tunnel.Manager
+	if *wgEnabled {
+		mgr, err := tunnel.NewManager(*serverIP, *wgPort)
+		if err != nil {
+			log.Fatalf("Failed to create tunnel manager: %v", err)
+		}
+
+		if err := mgr.Start(); err != nil {
+			log.Fatalf("Failed to start WireGuard: %v", err)
+		}
+
+		pm, err := tunnel.NewPeerManager(*serverIP)
+		if err != nil {
+			mgr.Stop()
+			log.Fatalf("Failed to create peer manager: %v", err)
+		}
+
+		for _, peer := range pm.ListPeers() {
+			if err := mgr.AddPeer(peer.PublicKey, peer.IPAddress+"/32"); err != nil {
+				logger.LogError("wg_add_peer_error", err, map[string]interface{}{
+					"peer": peer.Name,
+				})
+			} else {
+				logger.LogEvent("wg_peer_added", map[string]interface{}{
+					"peer":      peer.Name,
+					"ip":        peer.IPAddress,
+					"publicKey": peer.PublicKey,
+				})
+			}
+		}
+
+		tunnelMgr = mgr
+	}
+
+	server := &Server{
+		logger:      logger,
+		auth:        auth.NewAuthenticator(),
+		rateLimiter: auth.NewRateLimiter(),
+		ptyManager:  pty.NewManager(*shell),
+		tunnelMgr:   tunnelMgr,
+		port:        *port,
+		staticPath:  *staticPath,
+	}
+
 	if err := server.Start(); err != nil {
 		log.Fatalf("Server failed to start: %v", err)
 	}
